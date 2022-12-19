@@ -3,16 +3,20 @@ using Ryujinx.HLE.Exceptions;
 using Ryujinx.HLE.HOS.Ipc;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Threading;
+using Timer = System.Timers.Timer;
 
 namespace Ryujinx.HLE.HOS.Services
 {
     abstract class IpcService
     {
-        public IReadOnlyDictionary<int, MethodInfo> HipcCommands { get; }
-        public IReadOnlyDictionary<int, MethodInfo> TipcCommands { get; }
+        public IReadOnlyDictionary<int, Command> HipcCommands { get; }
+        public IReadOnlyDictionary<int, Command> TipcCommands { get; }
 
         public ServerBase Server { get; private set; }
 
@@ -28,20 +32,37 @@ namespace Ryujinx.HLE.HOS.Services
                 .SelectMany(type => type.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public))
                 .SelectMany(methodInfo => methodInfo.GetCustomAttributes(typeof(CommandHipcAttribute))
                 .Select(command => (((CommandHipcAttribute)command).Id, methodInfo)))
-                .ToDictionary(command => command.Id, command => command.methodInfo);
+                .ToDictionary(command => command.Id, command => CompileIPCCommand(command.methodInfo));
 
             TipcCommands = Assembly.GetExecutingAssembly().GetTypes()
                 .Where(type => type == GetType())
                 .SelectMany(type => type.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public))
                 .SelectMany(methodInfo => methodInfo.GetCustomAttributes(typeof(CommandTipcAttribute))
                 .Select(command => (((CommandTipcAttribute)command).Id, methodInfo)))
-                .ToDictionary(command => command.Id, command => command.methodInfo);
+                .ToDictionary(command => command.Id, command => CompileIPCCommand(command.methodInfo));
 
             Server = server;
 
             _parent = this;
             _domainObjects = new IdDictionary();
             _selfId = -1;
+        }
+
+        public delegate ResultCode Command(ServiceCtx context);
+
+        private Command CompileIPCCommand(MethodInfo info)
+        {
+            // create a parameter named "context" of type ServiceCtx
+            var context = Expression.Parameter(typeof(ServiceCtx), "context");
+            
+            // call the service method
+            var call = Expression.Call(Expression.Constant(this), info, context);
+            
+            // cast the result to a ResultCode
+            var convert = Expression.Convert(call, typeof(ResultCode));
+            
+            // compile it to a lambda expression (with a name, using the same name as the service method to keep logs consistent
+            return Expression.Lambda<Command>(convert, info.Name, true, new []{ context }).Compile();
         }
 
         public int ConvertToDomain()
@@ -107,7 +128,7 @@ namespace Ryujinx.HLE.HOS.Services
             long sfciMagic = context.RequestData.ReadInt64();
             int commandId = (int)context.RequestData.ReadInt64();
 
-            bool serviceExists = service.HipcCommands.TryGetValue(commandId, out MethodInfo processRequest);
+            bool serviceExists = service.HipcCommands.TryGetValue(commandId, out Command processRequest);
 
             if (context.Device.Configuration.IgnoreMissingServices || serviceExists)
             {
@@ -117,9 +138,9 @@ namespace Ryujinx.HLE.HOS.Services
 
                 if (serviceExists)
                 {
-                    Logger.Trace?.Print(LogClass.KernelIpc, $"{service.GetType().Name}: {processRequest.Name}");
+                    Logger.Trace?.Print(LogClass.KernelIpc, $"{service.GetType().Name}: {processRequest.Method.Name}");
 
-                    result = (ResultCode)processRequest.Invoke(service, new object[] { context });
+                    result = processRequest(context);
                 }
                 else
                 {
@@ -161,7 +182,7 @@ namespace Ryujinx.HLE.HOS.Services
         {
             int commandId = (int)context.Request.Type - 0x10;
 
-            bool serviceExists = TipcCommands.TryGetValue(commandId, out MethodInfo processRequest);
+            bool serviceExists = TipcCommands.TryGetValue(commandId, out Command processRequest);
 
             if (context.Device.Configuration.IgnoreMissingServices || serviceExists)
             {
@@ -171,9 +192,9 @@ namespace Ryujinx.HLE.HOS.Services
 
                 if (serviceExists)
                 {
-                    Logger.Debug?.Print(LogClass.KernelIpc, $"{GetType().Name}: {processRequest.Name}");
+                    Logger.Debug?.Print(LogClass.KernelIpc, $"{GetType().Name}: {processRequest.Method.Name}");
 
-                    result = (ResultCode)processRequest.Invoke(this, new object[] { context });
+                    result = processRequest(context);
                 }
                 else
                 {
